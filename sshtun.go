@@ -9,57 +9,62 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// SSHClientConfig is the configuration for the SSH client.
-type SSHClientConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-}
-
-// SSHServerConfig is the configuration for the SSH server.
-type SSHServerConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
+type SSHConfig struct {
+	Host            string
+	Port            int
+	User            string
+	Auth            ssh.AuthMethod
+	HostKeyCallback ssh.HostKeyCallback
 }
 
 // TunnelConfig is the configuration for the tunnel.
 type TunnelConfig struct {
-	LocalPort       int
-	Destination     string
-	HostKeyCallback ssh.HostKeyCallback
+	LocalPort   int
+	Destination string
+	Logf        func(string, ...any)
 }
 
 type SSHTunnel struct {
 	sshClient *ssh.Client
 	tc        TunnelConfig
 	stat      chan ConnStateMessage
+	logf      func(string, ...any)
 }
 
-func NewSSHTunnel(sshServer string, authMethod ssh.AuthMethod, localPort int, destination string, options ...TunnelOption) (*SSHTunnel, error) {
+func defaultLogf(format string, args ...any) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func NewSSHTunnel(conf SSHConfig, localPort int, destination string, options ...TunnelOption) (*SSHTunnel, error) {
 	tc := TunnelConfig{
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		LocalPort:       localPort,
-		Destination:     destination,
+		LocalPort:   localPort,
+		Destination: destination,
+		Logf:        defaultLogf,
 	}
 
 	for _, option := range options {
 		option(&tc)
 	}
 
+	if conf.Port == 0 {
+		conf.Port = 22
+	}
+
+	if conf.HostKeyCallback == nil {
+		conf.HostKeyCallback = ssh.InsecureIgnoreHostKey()
+	}
+
 	sshConfig := &ssh.ClientConfig{
-		User: "ssh_user",
+		User: conf.User,
 		Auth: []ssh.AuthMethod{
-			authMethod,
+			conf.Auth,
 		},
-		HostKeyCallback: tc.HostKeyCallback,
+		HostKeyCallback: conf.HostKeyCallback,
 		Timeout:         5 * time.Second,
 	}
 
 	// Connect to the SSH Server
-	sshClient, err := ssh.Dial("tcp", sshServer, sshConfig)
+	sshClient, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", conf.Host, conf.Port), sshConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +73,7 @@ func NewSSHTunnel(sshServer string, authMethod ssh.AuthMethod, localPort int, de
 		sshClient: sshClient,
 		tc:        tc,
 		stat:      make(chan ConnStateMessage),
+		logf:      tc.Logf,
 	}, nil
 }
 
@@ -84,22 +90,29 @@ func (t *SSHTunnel) Start() error {
 			// Accept a connection
 			localConn, err := listener.Accept()
 			if err != nil {
-				t.stat <- ConnStateMessage{
+				t.sendConnMessage(ConnStateMessage{
 					State: ConnStateError,
 					Err:   err,
-				}
+				})
 
 				break
 			}
+
+			t.sendConnMessage(ConnStateMessage{
+				State: ConnStateNew,
+				Msg:   fmt.Sprintf("New connection from %s", localConn.RemoteAddr().String()),
+			})
 
 			go func() {
 				// Establish a connection to the remote server
 				remoteConn, err := t.sshClient.Dial("tcp", t.tc.Destination)
 				if err != nil {
-					t.stat <- ConnStateMessage{
+					t.sendConnMessage(ConnStateMessage{
 						State: ConnStateError,
 						Err:   err,
-					}
+					})
+
+					return
 				}
 
 				// Start copying data between the local and remote connections
@@ -109,11 +122,33 @@ func (t *SSHTunnel) Start() error {
 		}
 	}()
 
-	t.stat <- ConnStateMessage{
+	t.sendConnMessage(ConnStateMessage{
 		State: ConnStateConnected,
-	}
+		Msg:   fmt.Sprintf("Tunnel established on localhost:%d", t.tc.LocalPort),
+	})
 
 	return nil
+}
+
+func (t *SSHTunnel) Close() {
+	t.sshClient.Close()
+}
+
+func (t *SSHTunnel) ConnState() <-chan ConnStateMessage {
+	return t.stat
+}
+
+func (t *SSHTunnel) sendConnMessage(msg ConnStateMessage) {
+	select {
+	case t.stat <- msg:
+	default:
+		strMsg := msg.Msg
+		if msg.Err != nil {
+			strMsg = msg.Err.Error()
+		}
+
+		t.logf(strMsg)
+	}
 }
 
 func copyConn(writer, reader net.Conn) {

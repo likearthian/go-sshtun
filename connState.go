@@ -19,4 +19,5 @@ const (
 type ConnStateMessage struct {
 	State ConnState
 	Err   error
+	Msg   string
 }
