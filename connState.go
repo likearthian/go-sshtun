@@ -14,6 +14,8 @@ const (
 
 	// ConnStateError represents an errored connection.
 	ConnStateError
+
+	ConnStateKeepAlive
 )
 
 type ConnStateMessage struct {

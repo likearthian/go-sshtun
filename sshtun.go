@@ -29,6 +29,7 @@ type SSHTunnel struct {
 	tc        TunnelConfig
 	stat      chan ConnStateMessage
 	logf      func(string, ...any)
+	stopChan  chan struct{}
 }
 
 func defaultLogf(format string, args ...any) {
@@ -74,6 +75,7 @@ func NewSSHTunnel(conf SSHConfig, localPort int, destination string, options ...
 		tc:        tc,
 		stat:      make(chan ConnStateMessage),
 		logf:      tc.Logf,
+		stopChan:  make(chan struct{}),
 	}, nil
 }
 
@@ -83,6 +85,31 @@ func (t *SSHTunnel) Start() error {
 	if err != nil {
 		return err
 	}
+
+	go func() {
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-tick.C:
+				// Send a keep-alive message
+				if _, _, err := t.sshClient.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+					t.sendConnMessage(ConnStateMessage{
+						State: ConnStateError,
+						Err:   err,
+					})
+				} else {
+					t.sendConnMessage(ConnStateMessage{
+						State: ConnStateKeepAlive,
+						Msg:   "Keep-alive message sent",
+					})
+				}
+			case <-t.stopChan:
+				return
+			}
+		}
+	}()
 
 	go func() {
 		defer listener.Close()
@@ -131,6 +158,7 @@ func (t *SSHTunnel) Start() error {
 }
 
 func (t *SSHTunnel) Close() {
+	t.stopChan <- struct{}{}
 	t.sshClient.Close()
 }
 
